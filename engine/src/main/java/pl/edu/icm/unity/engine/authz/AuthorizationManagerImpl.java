@@ -257,6 +257,9 @@ public class AuthorizationManagerImpl implements AuthorizationManager
 	public boolean isSelf(long subject)
 	{
 		InvocationContext authnCtx = InvocationContext.getCurrent();
+                if(authnCtx.getLoginSession() == null) {
+                    return false;
+                }
 		return authnCtx.getLoginSession().getEntityId() == subject;
 	}
 	

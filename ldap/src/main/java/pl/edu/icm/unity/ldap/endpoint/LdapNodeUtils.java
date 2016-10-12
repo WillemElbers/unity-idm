@@ -30,8 +30,8 @@ public class LdapNodeUtils
 				}
 			}
 		} else if (node instanceof SimpleNode)
-		{
-			SimpleNode<?> sns = (SimpleNode<?>) node;
+		{   
+                        SimpleNode<?> sns = (SimpleNode<?>) node;
 			if (sns.getAttribute().equals("objectClass"))
 			{
 				return sns.getValue().toString().equals("inetorgperson");

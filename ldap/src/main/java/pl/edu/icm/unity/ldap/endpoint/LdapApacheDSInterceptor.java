@@ -11,6 +11,7 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -18,6 +19,7 @@ import javax.imageio.ImageIO;
 
 import org.apache.directory.api.ldap.model.constants.AuthenticationLevel;
 import org.apache.directory.api.ldap.model.constants.SchemaConstants;
+import org.apache.directory.api.ldap.model.cursor.CursorException;
 import org.apache.directory.api.ldap.model.cursor.EmptyCursor;
 import org.apache.directory.api.ldap.model.cursor.SingletonCursor;
 import org.apache.directory.api.ldap.model.entry.Attribute;
@@ -29,6 +31,7 @@ import org.apache.directory.api.ldap.model.exception.LdapOtherException;
 import org.apache.directory.api.ldap.model.exception.LdapUnwillingToPerformException;
 import org.apache.directory.api.ldap.model.message.ResultCodeEnum;
 import org.apache.directory.api.ldap.model.name.Dn;
+import org.apache.directory.api.ldap.model.name.Rdn;
 import org.apache.directory.api.ldap.model.schema.AttributeType;
 import org.apache.directory.api.ldap.model.schema.AttributeTypeOptions;
 import org.apache.directory.api.util.StringConstants;
@@ -65,10 +68,13 @@ import pl.edu.icm.unity.server.authn.AuthenticationResult;
 import pl.edu.icm.unity.server.authn.AuthenticationResult.Status;
 import pl.edu.icm.unity.server.authn.InvocationContext;
 import pl.edu.icm.unity.server.utils.Log;
+import pl.edu.icm.unity.stdext.identity.PersistentIdentity;
 import pl.edu.icm.unity.types.authn.AuthenticationRealm;
 import pl.edu.icm.unity.types.basic.AttributeExt;
+import pl.edu.icm.unity.types.basic.Entity;
 import pl.edu.icm.unity.types.basic.EntityParam;
 import pl.edu.icm.unity.types.basic.GroupMembership;
+import pl.edu.icm.unity.types.basic.Identity;
 
 /**
  * ApacheDS interceptor implementation. This is the integration part between
@@ -131,6 +137,7 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 	@Override
 	public Entry lookup(LookupOperationContext lookupContext) throws LdapException
 	{
+                log.debug("[LOOKUP] "+lookupContext.toString());
 		boolean isMainBindUser = lookupContext.getDn().toString()
 				.equals(ServerDNConstants.ADMIN_SYSTEM_DN);
 		if (isMainBindUser)
@@ -147,7 +154,7 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 
 		// lookup for
 		Entry entry = new DefaultEntry(schemaManager, lookupContext.getDn());
-		String group = getGroup(lookupContext.getDn());
+		String group = getGroupFromDn(lookupContext.getDn());
 		if (null != group)
 		{
 			if (lookupContext.isAllOperationalAttributes())
@@ -184,27 +191,68 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 	public EntryFilteringCursor search(SearchOperationContext searchContext)
 			throws LdapException
 	{
-		// admin bind will not return true (we look for cn)
-		boolean userSearch = LdapNodeUtils.isUserSearch(searchContext.getFilter());
-		String username = LdapNodeUtils.getUserName(searchContext.getFilter(), new String[] { "cn",
-				"mail" });
-		// e.g., search by mail
-		if (userSearch && null == username)
-		{
-			return emptyResult(searchContext);
-		}
-		if (userSearch && !username.equals("ou=system"))
-		{
-			return getUser(searchContext, username);
-		}
+                try {
+                    // admin bind will not return true (we look for cn)
+                    boolean userSearch = LdapNodeUtils.isUserSearch(searchContext.getFilter());
+                    String username = LdapNodeUtils.getUserName(searchContext.getFilter(), new String[] { "cn",
+                                    "mail" });                
+                    log.debug("[SEARCH] "+searchContext.toString()+". userSearch="+userSearch+", username="+username);
 
-		EntryFilteringCursor ec = next(searchContext);
-		return ec;
+                    EntryFilteringCursor result = null;
+
+                    // e.g., search by mail
+                    if(userSearch) {
+                        result = userSearch(username, searchContext);
+                    } else {
+                        result = nonUserSearch(searchContext);
+                    }
+
+                    //If no result is generated, delegate to next interceptor
+                    if(result == null) {
+                        result = next(searchContext);
+                    }
+
+                    log.debug("[SEARCH RESPONSE] #entry filters="+result.getEntryFilters().size());
+                    //result.
+                    return result;
+                } catch(LdapException ex) {
+                    log.debug("LdapException", ex);
+                    throw ex;
+                }
 	}
 
+        protected EntryFilteringCursor userSearch(String username, SearchOperationContext searchContext) throws LdapException {
+            EntryFilteringCursor result = null;
+            if (null == username) {
+                Rdn rdn = searchContext.getDn().getRdn();
+                if(rdn.getType().equalsIgnoreCase("cn")) {
+                    //owncloud
+                    username = rdn.getValue();
+                    result = getUser(searchContext, username);
+                } else {
+                    //drupal
+                    result = emptyResult(searchContext);  
+                }
+
+            } else if (!username.equals("ou=system")) {
+                result = getUser(searchContext, username);
+            }
+            return result;
+        }
+        
+        protected EntryFilteringCursor nonUserSearch(SearchOperationContext searchContext) throws LdapException {
+            EntryFilteringCursor result = null;
+            Rdn rdn = searchContext.getDn().getRdn();
+            if(rdn.getType().equalsIgnoreCase("cn")) {
+                result = getUser(searchContext, rdn.getValue());
+            }
+            return result;
+        }
+        
 	@Override
 	public void bind(BindOperationContext bindContext) throws LdapException
 	{
+                log.debug("[BIND] "+bindContext.toString());
 		InvocationContext ctx = resetInvocationContext();
 		
 		if (bindContext.isSaslBind())
@@ -274,46 +322,53 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 	@Override
 	public boolean compare(CompareOperationContext compareContext) throws LdapException
 	{
-		String group_member = configuration.getValue(LdapServerProperties.GROUP_MEMBER);
-		String group_member_user_regexp = configuration
-				.getValue(LdapServerProperties.GROUP_MEMBER_USER_REGEXP);
-		// we know how to do members
-		if (compareContext.getAttributeType().getName().equals(group_member))
-		{
-			try
-			{
-				boolean group_found = false;
-				String user = compareContext.getValue().getString();
-				Pattern p = Pattern.compile(group_member_user_regexp);
-				Matcher m = p.matcher(user);
-				if (m.find())
-				{
-					user = m.group(1);
-					long userEntityId = userMapper.resolveUser(user, realm.getName());
-					// Collection<AttributeExt<?>> attrs =
-					// attributesMan.getAllAttributes(
-					// new EntityParam(userEntityId), true,
-					// null, null, true
-					// );
+            log.debug("compare: "+compareContext.toString());
+            String group_member = configuration.getValue(LdapServerProperties.GROUP_MEMBER);
+            String group_member_user_regexp = configuration
+                            .getValue(LdapServerProperties.GROUP_MEMBER_USER_REGEXP);
+            // we know how to do members
+            if (compareContext.getAttributeType().getName().equals(group_member))
+            {
+                try
+                {
+                    String userAlternative = getUserName(compareContext.getOriginalEntry().getDn());
+                    
+                    boolean group_found = false;
+                    String user = compareContext.getValue().getString();
+                    Pattern p = Pattern.compile(group_member_user_regexp);
+                    Matcher m = p.matcher(user);
+                    if (m.find())
+                    {
+                        user = m.group(1);
+                        long userEntityId = userMapper.resolveUser(user, realm.getName());
+                        // Collection<AttributeExt<?>> attrs =
+                        // attributesMan.getAllAttributes(
+                        // new EntityParam(userEntityId), true,
+                        // null, null, true
+                        // );
 
-					Map<String, GroupMembership> grps = identitiesMan
-							.getGroups(new EntityParam(userEntityId));
-					String group = getGroup(compareContext.getOriginalEntry()
-							.getDn());
-					if (grps.containsKey(group))
-					{
-						group_found = true;
-					}
-					return group_found;
-				}
-			} catch (EngineException e)
-			{
-				throw new LdapOtherException("Error when comaring", e);
-			}
-			return false;
-		}
+                        Map<String, GroupMembership> grps = 
+                            identitiesMan
+                                .getGroups(new EntityParam(userEntityId));
+                        String group = 
+                            getGroupFromDn(compareContext.getOriginalEntry().getDn());
+                        if (grps.containsKey(group))
+                        {
+                                group_found = true;
+                        }
+                        return group_found;   
+                    }
+                } catch (EngineException e) {
+                    log.error("Error when comaring", e);
+                    throw new LdapOtherException("Error when comaring", e);
+                } catch(Exception e) {
+                    log.error("Error when comaring", e);
+                    throw new LdapOtherException("Error when comaring", e);
+                }
+                return false;
+            }
 
-		return next(compareContext);
+            return next(compareContext);
 	}
 
 	//
@@ -400,11 +455,19 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 		case SchemaConstants.USER_PASSWORD_AT:
 			da = lsf.getAttribute(SchemaConstants.USER_PASSWORD_AT,
 					SchemaConstants.USER_PASSWORD_AT_OID);
-			da.add("not disclosing");
+			da.add("not disclosed");
 			break;
 		case SchemaConstants.CN_AT:
 			da = lsf.getAttribute(SchemaConstants.CN_AT, SchemaConstants.CN_AT_OID);
 			da.add(username);
+			break;
+                case SchemaConstants.UID_AT:
+                        try {
+                            da = lsf.getAttribute(SchemaConstants.ENTRY_UUID_AT, SchemaConstants.ENTRY_UUID_AT_OID);
+                            da.add(getUserUuid(username));
+                        } catch(EngineException | LdapException ex) {
+                            log.error("No uuid found in persistent identity for user: "+username, ex);
+                        }
 			break;
 		case SchemaConstants.MAIL_AT:
 		case SchemaConstants.EMAIL_AT:
@@ -460,17 +523,21 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 	/**
 	 * Get groups from LDAP DN.
 	 */
-	private String getGroup(Dn dn)
+	private String getGroupFromDn(Dn dn)
 	{
-		String group_query = configuration.getValue(LdapServerProperties.GROUP_QUERY);
-		for (org.apache.directory.api.ldap.model.name.Rdn rdn : dn.getRdns())
-		{
-			if (rdn.getAva().toString().equals(group_query))
-			{
-				return dn.getRdn().getAva().getValue().getString();
-			}
-		}
-		return null;
+            String group_query = configuration.getValue(LdapServerProperties.GROUP_QUERY);
+            for (org.apache.directory.api.ldap.model.name.Rdn rdn : dn.getRdns())
+            {
+                if (rdn.getAva().toString().equals(group_query))
+                {
+                    String groupFromDn = dn.getRdn().getAva().getValue().getString();
+                    if(!groupFromDn.startsWith("/")) {
+                        groupFromDn = "/"+groupFromDn;
+                    }
+                    return groupFromDn;
+                }
+            }
+            return null;
 	}
 
 	/**
@@ -490,6 +557,18 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 		return null;
 	}
 
+        private String getUserUuid(String username) throws IllegalIdentityValueException, EngineException {
+            long userEntityId = userMapper.resolveUser(username, realm.getName());
+            String uuid = null;
+            Entity entity = identitiesMan.getEntity(new EntityParam(userEntityId));
+            for(Identity id : entity.getIdentities()) {
+                if(id.getTypeId().equalsIgnoreCase(PersistentIdentity.ID)) {
+                    uuid = id.getValue();
+                }
+            }
+            return uuid;
+        }
+        
 	/**
 	 * Get Unity user from LDAP search context.
 	 */
@@ -503,10 +582,22 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 		try
 		{
 			long userEntityId = userMapper.resolveUser(username, realm.getName());
-
+                       
+                        /*
+                        String uuid = null;
+                        Entity entity = identitiesMan.getEntity(new EntityParam(userEntityId));
+                        for(Identity id : entity.getIdentities()) {
+                            if(id.getTypeId().equalsIgnoreCase(PersistentIdentity.ID)) {
+                                uuid = id.getValue();
+                            }
+                        }
+                        */
+                        //identitiesMan.
 			Collection<AttributeExt<?>> attrs = attributesMan.getAttributes(
 					new EntityParam(userEntityId), null, null);
 
+                        
+                        
 			Set<AttributeTypeOptions> attributes = new HashSet<AttributeTypeOptions>();
 			if (null != searchContext.getReturningAttributes())
 			{
@@ -522,18 +613,36 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 				}
 			}
 
+                        
+                        boolean addedUuid = false;
 			for (AttributeTypeOptions ao : attributes)
 			{
 				String aName = ao.getAttributeType().getName();
+                                //log.debug("[ATTRIBUTE] "+aName);
+                                if(aName.equalsIgnoreCase(SchemaConstants.UID_AT)) {
+                                    addedUuid = true;
+                                }
 				addAttribute(aName, username, attrs, entry);
+                                /*
 				if (aName.equals("cn"))
 				{
 					String requestDn = "cn=" + username + ","
 							+ searchContext.getDn().toString();
 					entry.setDn(requestDn);
 				}
+                                */
 			}
+                        
+                        //Make sure we always add the uuid
+                        if(!addedUuid) {
+                            addAttribute(SchemaConstants.UID_AT, username, attrs, entry);
+                        }
+                        
+                        String requestDn = "cn=" + username + ","+ searchContext.getDn().toString();
+                        entry.setDn(requestDn);
 
+                        //log.debug("[LDAP ENTRY] "+entry.toString());
+                        
 			return new EntryFilteringCursorImpl(new SingletonCursor<>(entry),
 					searchContext, lsf.getDs().getSchemaManager());
 
@@ -545,6 +654,8 @@ public class LdapApacheDSInterceptor extends BaseInterceptor
 			throw new LdapOtherException("Error establishing user information", e);
 		}
 
+                log.debug("[LDAP ENTRY] <empty>");
+                
 		return emptyResult(searchContext);
 	}
 
